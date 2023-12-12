@@ -133,7 +133,7 @@ class BlastStream(SailthruStream):
 
     name = "blasts"
     path = "blast"
-    primary_keys = ["id"]
+    primary_keys = ["blast_id"]
     replication_key = "start_time"
     schema_filepath = SCHEMAS_DIR / "blasts.json"
 
