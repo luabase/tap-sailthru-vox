@@ -2,16 +2,14 @@
 
 import copy
 import csv
-import heapq
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, Optional
 
 import backoff
 import pendulum
 import requests
-from google.cloud import bigquery
 from requests.exceptions import ChunkedEncodingError
 from sailthru.sailthru_client import SailthruClient
 from sailthru.sailthru_error import SailthruClientError
@@ -101,7 +99,7 @@ class SailthruJobStream(SailthruStream):
                     else:
                         yield self.post_process(dicted_row)
             except ChunkedEncodingError:
-                self.logger.info(
+                self.logger.error(
                     "Chunked Encoding Error in the list member stream, stopping early"
                 )
                 pass
@@ -150,6 +148,28 @@ class BlastStream(SailthruStream):
         """
         return self.path
 
+    def get_records(self, context: dict | None):
+        """Return a generator of record-type dictionary objects.
+
+        Each record emitted should be a dictionary of property names to their values.
+
+        Args:
+            context: Stream partition or context dictionary.
+
+        Yields:
+            One item per (possibly processed) record in the API.
+        """
+        # Must query by status. https://getstarted.sailthru.com/developers/api/blast/
+        all_statuses = ["sent"]
+        for status in all_statuses:
+            self.blast_stream_query_status = status
+            for record in self.request_records(context):
+                transformed_record = self.post_process(record, context)
+                if transformed_record is None:
+                    # Record filtered out during post_process()
+                    continue
+                yield transformed_record
+
     def prepare_request_payload(
         self, context: Optional[dict], next_page_token: Optional[str] = None
     ) -> dict:
@@ -159,7 +179,7 @@ class BlastStream(SailthruStream):
         :returns: dict, A dictionary containing the request payload.
         """
         return {
-            "status": "sent",
+            "status": self.blast_stream_query_status,
             "limit": 0,
             "start_date": self.stream_state.get("starting_replication_value"),
         }
@@ -302,7 +322,7 @@ class BlastQueryStream(SailthruJobStream):
     name = "blast_query"
     job_name = "blast_query"
     path = "job"
-    primary_keys = ["job_id"]
+    primary_keys = ["profile_id", "blast_id"]
     schema_filepath = SCHEMAS_DIR / "blast_query.json"
     parent_stream_type = BlastStream
 
@@ -337,6 +357,7 @@ class BlastQueryStream(SailthruJobStream):
             # Error code 99 = You may not export a blast that has been sent
             # pylint: disable=logging-fstring-interpolation
             self.logger.info(f"Skipping blast_id: {blast_id}")
+            return
         try:
             export_url = self.get_job_url(client=client, job_id=response["job_id"])
         except MaxRetryError:
@@ -475,114 +496,6 @@ class PrimaryListStream(ListStream):
             yield row
 
 
-class ListMembersParentStream(SailthruStream):
-    """Manufactured Stream to help with load balancing for List Members stream."""
-
-    name = "list_members_parent"
-    schema_filepath = SCHEMAS_DIR / "lists.json"
-
-    def query_for_lists(self, context: Optional[dict]) -> List[dict]:
-        """Send query to data warehouse to retrieve newsletter data."""
-        lists_query = f"""
-            SELECT
-                id as list_id,
-                list_name,
-                max(valid_email_count) email_count
-            FROM `{self.config.get('table_id')}`
-            where
-                account = @account_name
-                and is_primary
-            group by 1, 2
-            order by 2
-        """
-        self.logger.info(f"Executing query: {lists_query}")
-        client = bigquery.Client()
-        query_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter(
-                    "account_name", "STRING", self.config.get("account_name")
-                )
-            ]
-        )
-        results = client.query(lists_query, job_config=query_config).result()
-        return results
-
-    def split_lists_into_chunks(
-        self, list_results: List, num_chunks: int, context: Optional[dict]
-    ):
-        """Split list of newsletters using a priority queue into sub-arrays.
-
-        Using the PSL heapq library, receives a list of dictionaries
-        containing data about email newsletters and divides the list into
-        a configurable number of lists whose summed size is as equal as possible.
-        Loops through list of newsletters and appends each newsletter
-        to the sub-array that has the smallest size at that time.
-
-        Args:
-            list_results (List): list of dicts with newsletter data
-                e.g. [{
-                    'list_id': 'SAMPLE_LIST_ID',
-                    'list_name': 'SAMPLE_LIST_NAME',
-                    'email_count': 100
-                }]
-            num_chunks (int): number of sub-arrays to create, comes from tap config
-            context (Optional[dict]): optional meltano context dictionary
-        """
-        list_names = [[] for _ in range(num_chunks)]
-        list_ids = [[] for _ in range(num_chunks)]
-        totals = [(0, i) for i in range(num_chunks)]
-        # create a heap, a priority queue
-        # in which the smallest element receives the highest priority
-        heapq.heapify(totals)
-        # get the chunk with the highest priority (lowest cumulative email count)
-        for list_result in list_results:
-            total, index = heapq.heappop(
-                totals
-            )
-            # append the newsletter name to the corresponding array
-            list_names[index].append(list_result.list_name)
-            list_ids[index].append(list_result.list_id)
-            # add the valid count of the added newsletter, then re-prioritize the queue
-            heapq.heappush(
-                totals, (total + list_result.email_count, index)
-            )
-        return list_names, list_ids
-
-    def request_records(self, context: Optional[dict]) -> Iterable[dict]:
-        """Retrieve records from SQL query, returning response records.
-
-        Args:
-            context: Stream partition or context dictionary.
-
-        Yields:
-            An item for every record in the response.
-        """
-        number_of_chunks = self.config.get("num_chunks")
-        results = self.query_for_lists(context=context)
-        list_names, list_ids = self.split_lists_into_chunks(
-            results, number_of_chunks, context=context
-        )
-        self.logger.info(list_names)
-
-        for list_name, list_id in zip(
-            list_names[self.config.get("chunk_number")],
-            list_ids[self.config.get("chunk_number")],
-        ):
-            yield {"list_name": list_name, "list_id": list_id}
-
-    def get_child_context(self, record: dict, context: Optional[dict]) -> dict:
-        """Return a child context object from the record and optional provided context.
-
-        Args:
-            record (dict): Individual record from the stream
-            context (Optional[dict]): Stream partition or context dictionary
-
-        Returns:
-            dict: dictionary with context for the child stream
-        """
-        return {"list_name": record["list_name"], "list_id": record["list_id"]}
-
-
 class ListStatsStream(SailthruStream):
     """Define custom stream."""
 
@@ -649,7 +562,7 @@ class ListMemberStream(SailthruJobStream):
     job_name = "list_members"
     path = "job"
     schema_filepath = SCHEMAS_DIR / "list_members.json"
-    parent_stream_type = ListMembersParentStream
+    parent_stream_type = ListStream
 
     def prepare_request_payload(
         self, context: Optional[dict], next_page_token: Optional[str] = None
@@ -731,7 +644,7 @@ class UsersStream(SailthruJobStream):
     path = "user"
     primary_keys = ["email"]
     schema_filepath = SCHEMAS_DIR / "users.json"
-    parent_stream_type = PrimaryListStream
+    parent_stream_type = ListStream
 
     def prepare_request_payload(
         self, context: Optional[dict], next_page_token: Optional[str] = None
@@ -748,10 +661,6 @@ class UsersStream(SailthruJobStream):
             "job": "snapshot",
             "query": {
                 "source_list": context["list_name"],
-                "criteria": ["var_date"],
-                "field": ["signup"],
-                "timerange": ["since_date"],
-                "value": ["-3 days"],
             },
         }
 
@@ -776,7 +685,7 @@ class UsersStream(SailthruJobStream):
         try:
             export_url = self.get_job_url(client=client, job_id=response["job_id"])
         except MaxRetryError:
-            self.logger.info(f"Skipping list: {list_name}")
+            self.logger.error(f"Skipping list: {list_name}")
             return
 
         # Add list id to each record
