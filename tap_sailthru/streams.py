@@ -636,67 +636,88 @@ class ListMemberStream(SailthruJobStream):
             return None
         return new_row
 
+    def get_child_context(self, record: dict, context: Optional[dict]) -> dict:
+        return {"list_id": record["list_id"], "profile_id": record["profile_id"]}
 
-class UsersStream(SailthruJobStream):
+
+class UsersStream(SailthruStream):
     """Define custom stream."""
 
     name = "users"
     path = "user"
     primary_keys = ["email"]
     schema_filepath = SCHEMAS_DIR / "users.json"
-    parent_stream_type = ListStream
+    parent_stream_type = ListMemberStream
+    state_partitioning_keys = []
 
-    def prepare_request_payload(
-        self, context: Optional[dict], next_page_token: Optional[str] = None
-    ) -> dict:
-        """Prepare request payload.
+    def get_url(self, context: Optional[dict]) -> str:
+        return self.path
 
+    @backoff.on_exception(backoff.expo,
+                          TimeoutError,
+                          max_tries=5,
+                          factor=4)
+    def request_records(self, context: Optional[dict]) -> Iterable[dict]:
+        """Request records from REST endpoint(s), returning response records.
+        If pagination is detected, pages will be recursed automatically.
         Args:
             context: Stream partition or context dictionary.
+        Yields:
+            An item for every record in the response.
+        Raises:
+            RuntimeError: If a loop in pagination is detected. That is, when two
+                consecutive pagination tokens are identical.
+        """
+        next_page_token= None
+        finished = False
 
+        client = self.authenticator
+        http_method = self.rest_method
+        url: str = self.get_url(context)
+        request_data = self.prepare_request_payload(context, next_page_token) or {}
+        headers = self.http_headers
+
+        while not finished:
+            try:
+                request = client._api_request(
+                    url,
+                    request_data,
+                    http_method,
+                    headers=headers
+                )
+                resp = request.get_body()
+                yield from self.parse_response(resp, context=context)
+                previous_token = copy.deepcopy(next_page_token)
+                next_page_token = self.get_next_page_token(
+                    response=resp, previous_token=previous_token
+                )
+                if next_page_token and next_page_token == previous_token:
+                    raise RuntimeError(
+                        f"Loop detected in pagination. "
+                        f"Pagination token {next_page_token} is identical to prior token."
+                    )
+                # Cycle until get_next_page_token() no longer returns a value
+                finished = not next_page_token
+            except SailthruClientError:
+                self.logger.info(f"SailthruClientError for User ID : {request_data['id']}")
+                pass
+
+    def prepare_request_payload(
+        self,
+        context: Optional[dict],
+        next_page_token: Optional[str] = None
+    ) -> dict:
+        """Prepare request payload.
+        Args:
+            context: Stream partition or context dictionary.
         Returns:
             A dictionary containing the request payload.
         """
+        sid = context['profile_id']
         return {
-            "job": "snapshot",
-            "query": {
-                "source_list": context["list_name"],
-            },
+            'id': sid,
+            'key': 'sid',
         }
-
-    def get_records(self, context: Optional[dict]):
-        """Retrieve records by creating and processing export job.
-
-        Args:
-            context (Optional[dict]): Stream partition or context dictionary
-
-        Yields:
-            dict: Individual record from stream
-        """
-        list_name = context["list_name"]
-        client = self.authenticator
-        payload = self.prepare_request_payload(context=context)
-        response = client.api_post("job", payload).get_body()
-        if response.get("error"):
-            # https://getstarted.sailthru.com/developers/api/job/#Error_Codes
-            # Error code 99 = You may not export a blast that has been sent
-            # pylint: disable=logging-fstring-interpolation
-            self.logger.info(f"Skipping list_name: {list_name}")
-        try:
-            export_url = self.get_job_url(client=client, job_id=response["job_id"])
-        except MaxRetryError:
-            self.logger.error(f"Skipping list: {list_name}")
-            return
-
-        # Add list id to each record
-        yield from self.process_job_csv(
-            export_url=export_url,
-            parent_params={
-                "list_name": list_name,
-                "list_id": context["list_id"],
-                "account_name": self.config.get("account_name"),
-            },
-        )
 
     def parse_response(self, response: dict, context: Optional[dict]) -> Iterable[dict]:
         """Parse the response and return an iterator of result rows."""
