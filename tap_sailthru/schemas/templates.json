@@ -7,7 +7,7 @@
         "template_id": {
         "type": [
             "null",
-            "string"
+            "integer"
         ]
         },
         "account_name": {
