@@ -29,7 +29,7 @@ class SailthruStream(RESTStream):
         return SailthruClient(
             self.config.get("api_key"),
             self.config.get("api_secret"),
-            request_timeout=20,
+            request_timeout=self.config.get("request_timeout"),
         )
 
     @property
